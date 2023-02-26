@@ -3,13 +3,16 @@
 # This file is an script that runs rrt algorithm for a unicycle.
 # Author: Farshid Asadi, farshidasadi47@yahoo.com
 ########## Libraries ###################################################
-import timeit
+from typing import TypedDict, List
 import numpy as np
 import triangle as tr
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
+import matplotlib.animation as animation
 import cv2 as cv
 import fcl
+
+from dubins import Dubins
 
 np.set_printoptions(precision=1, suppress=True)
 np.random.seed(1000)
@@ -238,6 +241,294 @@ class Collision:
         return cmanager, col_req, dis_req
 
 
+class RRTDubins:
+    class Node(TypedDict):
+        pos: np.ndarray
+        parent: int
+        path: np.ndarray
+        cost: float
+
+    class Path(TypedDict):
+        nodes: List
+        cost: float
+
+    def __init__(
+        self,
+        start,
+        goal,
+        bounds,
+        collision,
+        stypes,
+        obs_contours,
+        max_size=1000,
+        max_stride=1000000,
+        min_res=1.0,
+        min_radius=10.0,
+        goal_bias=0.05,
+    ) -> None:
+        start = np.array(start, dtype=float).squeeze()
+        goal = np.array(goal, dtype=float).squeeze()
+        self.start = self.Node(
+            pos=start, parent=-1, path=None, cost=0.0, radius=float("inf")
+        )
+        self.goal = self.Node(
+            pos=goal, parent=-1, path=None, cost=0.0, radius=float("inf")
+        )
+        (lbx, ubx), (lby, uby) = bounds
+        self.lb = np.array([lbx, lby, -np.pi])
+        self.ub = np.array([ubx, uby, np.pi])
+        self.collision = collision
+        self.steer = Dubins(stypes)
+        self.obs_contours = obs_contours
+        self.max_size = max_size
+        self.max_stride = int(max_stride)
+        self.min_res = min_res
+        self.step = int(self.max_stride / self.min_res)
+        self.min_radius = min_radius
+        self.goal_bias = goal_bias
+        #
+        self.nodes = [self.start]
+        self.paths = []
+        self.N = 1
+        self._n_state = 3
+        self._poses = np.zeros((max_size * 10, self._n_state))
+        self._poses[0] = self.start["pos"].copy()
+        weights = np.array([1, 1, 0], dtype=float)
+        self._weights = weights / np.linalg.norm(weights)
+
+    def plan(self, fig_name=None, anim_name=False, anim_online=False):
+        artists = []
+        fig, ax = plt.subplots(constrained_layout=True)
+        fig, ax, cid = self._set_up_plot(fig, ax)
+        # artists.append(ax.get_children())
+        found = False
+        for i in range(1, self.max_size):
+            # Draw a collision free sample from state space.
+            rnd = self._sample_collision_free()
+            # Find nearest node
+            nearest_ind, nearest_node = self._nearest_node(rnd)
+            # Calculate path from nearest to rnd.
+            path = self._steer(nearest_node["pos"], rnd)
+            # Check the path for collision.
+            is_collision, ind_collision = self._is_collision(path)
+            # Add new nodes.
+            new_nodes = self._extend(
+                nearest_ind, nearest_node, path, ind_collision
+            )
+            print(f"iteration = {i:>6d}")
+            # Draw path and check for stoppage.
+            arts = []
+            for node in new_nodes:
+                arts += self._draw(ax, node, color="deepskyblue", zorder=1)
+                # Check if reached to goal.
+                if self._weighted_norm(node["pos"] - self.goal["pos"]) < 1e-3:
+                    found = True
+                    print("found")
+            if arts and anim_name:
+                artists.append(arts)
+            #
+            if anim_online:
+                plt.pause(0.001)
+            #
+            if found:
+                break
+        # Generate final path and draw it.
+        if found:
+            path = self._generate_path()
+            arts = []
+            for node in path["nodes"]:
+                arts += self._draw(ax, node, color="magenta", zorder=3)
+            if arts:
+                artists.append(arts)
+            plt.pause(0.001)
+        # Saving final figure.
+        if fig_name is not None:
+            self._save_plot(fig, fig_name)
+        # Generating animation and saving it if requested.
+        anim = []
+        if anim_name:
+            fig, ax, anim = self._make_save_animation(
+                fig, ax, cid, artists, anim_name
+            )
+        return fig, ax, anim
+
+    def _sample(self):
+        prob = np.random.rand()
+        if prob > self.goal_bias:
+            return np.random.uniform(self.lb, self.ub)
+        else:
+            return self.goal["pos"]
+
+    def _sample_collision_free(self):
+        while True:
+            rnd = self._sample()
+            rndc = rnd.copy()
+            rndc[-1] = 0.0
+            is_collision, _ = self.collision.is_collision(rndc[None, :])
+            if not is_collision:
+                break
+        return rnd
+
+    def _nearest_node(self, pos):
+        dposes = self._poses[: self.N] - pos
+        distances = self._weighted_norm(dposes)
+        nearest_ind = np.argmin(distances)
+        nearest_node = self.nodes[nearest_ind]
+        return nearest_ind, nearest_node
+
+    def _weighted_norm(self, vects):
+        return np.sum(
+            self._weights * vects.reshape(-1, self._n_state) ** 2, axis=1
+        )
+
+    def _steer(self, from_pos, to_pos):
+        path, _, _ = self.steer.steer(
+            from_pos,
+            to_pos,
+            step_size=self.min_res,
+            min_radius=self.min_radius,
+        )
+        return path
+
+    def _is_collision(self, path):
+        pathc = path.copy()
+        pathc[:, 2] = 0.0
+        is_collision, ind_collision = self.collision.is_collision(pathc)
+        ind_collision += (not is_collision) * (len(path) + 1)
+        return is_collision, ind_collision
+
+    def _extend(self, nearest_ind, nearest_node, path, ind_collision):
+        nodes = []
+        lpath = len(path)
+        if lpath > 1:
+            step = min(lpath - 1, self.step)
+            if ind_collision > max(1, step):
+                cost = nearest_node["cost"] + step * self.min_res
+                node = self.Node(
+                    pos=path[step],
+                    parent=nearest_ind,
+                    path=path[: step + 1],
+                    cost=cost,
+                    radius=float("inf"),
+                )
+                self._poses[self.N] = path[step]
+                self.nodes.append(node)
+                nodes.append(node)
+                self.N += 1
+        return nodes
+
+    def _generate_path(self):
+        # Generate final path and draw it.
+        path_nodes = [self.nodes[self.N - 1]]
+        cost = path_nodes[0]["cost"]
+        print(f"Number of tree nodes {self.N}")
+        while True:
+            parent = path_nodes[0]["parent"]
+            if parent < 1:
+                break
+            path_nodes.insert(0, self.nodes[parent])
+            cost += path_nodes[0]["cost"]
+        path = self.Path(nodes=path_nodes, cost=cost)
+        self.paths.append(path)
+        return path
+
+    def _set_up_plot(self, fig, ax, cid=-1):
+        if cid != -1:
+            fig.canvas.mpl_disconnect(cid)
+        else:
+            cid = fig.canvas.mpl_connect(
+                "key_release_event",
+                lambda event: [exit(0) if event.key == "escape" else None],
+            )
+        ax.clear()
+        ax.grid(zorder=0.0)
+        # Draw obstacles.
+        for i, cnt in enumerate(self.obs_contours):
+            ax.add_patch(Polygon(cnt, color="k", zorder=2.0))
+        # Draw start and end.
+        ax.plot(
+            self.start["pos"][0],
+            self.start["pos"][1],
+            ls="",
+            marker="s",
+            mfc="yellow",
+            mec="k",
+            zorder=10.0,
+            label="start",
+        )
+        ax.plot(
+            self.goal["pos"][0],
+            self.goal["pos"][1],
+            ls="",
+            marker="s",
+            mfc="lime",
+            mec="k",
+            zorder=10.0,
+            label="goal",
+        )
+        ax.legend()
+        # Boundaries.
+        lbx, lby = self.lb[:2]
+        ubx, uby = self.ub[:2]
+        ax.set_xlim(lbx, ubx)
+        ax.set_ylim(lby, uby)
+        #
+        ax.set_title("Dubins car RRT planning")
+        ax.set_aspect("equal", adjustable="box")
+        return fig, ax, cid
+
+    def _draw(self, ax, node, color="deepskyblue", zorder=1):
+        arts = []
+        pos = node["pos"]
+        path = node["path"]
+        n = min(2, len(path))
+        arts += ax.plot(
+            path[:, 0], path[:, 1], ls="-", lw=1.0, c=color, zorder=zorder
+        )
+        dx = path[-1, 0] - path[-n, 0]
+        dy = path[-1, 1] - path[-n, 1]
+
+        arts.append(
+            ax.arrow(
+                path[-n, 0],
+                path[-n, 1],
+                dx,
+                dy,
+                length_includes_head=True,
+                head_width=5.0,
+                head_length=10.0,
+                color=color,
+                zorder=zorder,
+            )
+        )
+        return arts
+
+    def _save_plot(self, fig, name):
+        """Overwrites files if they already exist."""
+        fig_name = f"{name}.pdf"
+        fig.savefig(fig_name, bbox_inches="tight", pad_inches=0.05)
+
+    def _animate(self, arts, ax):
+        for art in arts:
+            ax.add_artist(art)
+
+    def _make_save_animation(self, fig, ax, cid, artists, anim_name):
+        print("Starting animation processing.")
+        fig, ax, cid = self._set_up_plot(fig, ax, cid)
+        anim = animation.FuncAnimation(
+            fig,
+            self._animate,
+            fargs=(ax,),
+            interval=10,
+            frames=artists,
+            repeat_delay=1000,
+        )
+        print("Animation is produced.")
+        anim.save(anim_name + ".gif", fps=8)
+        print("Animation is saved. You can close the figure.")
+        return fig, ax, anim
+
+
 def test_collision():
     # Get space from masked image and calculate obstacle and space mesh.
     space = WorkSpaceImg("./world2.png")
@@ -275,6 +566,40 @@ def test_collision():
     plt.show()
 
 
+def test_rrt():
+    # Get space from masked image and calculate obstacle and space mesh.
+    space = WorkSpaceImg("./world2.png")
+    obs_contours = space.get_cartesian_obstacle_contours()
+    mesh, mesh_contours = space.get_obstacle_mesh()
+    # Set up collosion detector with some examples.
+    collision = Collision(mesh, rrob=5.0)
+    # Set up planner.
+    stypes = ["LSL", "RSR", "LSR", "RSL", "RLR", "LRL"]
+    # RRT planning.
+    start = np.array([-300, -50, np.deg2rad(45)], dtype=float)
+    goal = np.array([200, 100, np.deg2rad(-45)], dtype=float)
+    rrt = RRTDubins(
+        start,
+        goal,
+        space.bounds,
+        collision,
+        stypes,
+        obs_contours,
+        max_size=2000,
+        max_stride=1000,
+        min_res=1.0,
+        min_radius=20.0,
+        goal_bias=0.05,
+    )
+    anim_online = False  # True#
+    fig_name = None  # "final_plan"#
+    anim_name = None  # "final_plan"#
+    fig, ax, anim = rrt.plan(
+        fig_name=fig_name, anim_name=anim_name, anim_online=anim_online
+    )
+    plt.show()
+
+
 ########## Test ########################################################
 if __name__ == "__main__":
-    test_collision()
+    test_rrt()
