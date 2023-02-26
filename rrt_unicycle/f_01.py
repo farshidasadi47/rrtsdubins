@@ -232,7 +232,7 @@ class Collision:
         cmanager.registerObjects(self.obstacles)
         cmanager.setup()
         col_req = fcl.CollisionRequest(
-            num_max_contacts=10, enable_contact=True
+            num_max_contacts=1000, enable_contact=True
         )
         dis_req = fcl.DistanceRequest()
         return cmanager, col_req, dis_req
