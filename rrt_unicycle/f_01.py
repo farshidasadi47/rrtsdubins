@@ -3,6 +3,8 @@
 # This file is an script that runs rrt algorithm for a unicycle.
 # Author: Farshid Asadi, farshidasadi47@yahoo.com
 ########## Libraries ###################################################
+import time
+import random
 import cProfile
 from typing import TypedDict, List
 import re
@@ -18,7 +20,9 @@ import fcl
 from dubins import Dubins
 
 np.set_printoptions(precision=1, suppress=True)
-np.random.seed(1000)
+seed = 1000
+np.random.seed(seed)
+random.seed(a=seed)
 
 
 ########## Classes and Methods #########################################
@@ -245,18 +249,18 @@ class Collision:
 
 
 class RRTDubins:
-    class Node(TypedDict):
+    class Nodes(TypedDict):
         pos: np.ndarray
-        parent: int
-        child: list
-        path: np.ndarray
-        stage_cost: float
-        cost: float
-        artists: List
+        parent: np.ndarray
+        childs: List
+        path: List
+        cost: np.ndarray
+        value: np.ndarray
 
     class Path(TypedDict):
-        nodes: List
-        cost: float
+        inds: List
+        paths: List
+        value: float
 
     def __init__(
         self,
@@ -274,27 +278,25 @@ class RRTDubins:
         goal_bias=0.05,
         threshold=1e-3,
     ) -> None:
+        self.N = 0  # Number of nodes of current tree.
+        self.n_state = 3
+        self._nposes = np.zeros((max_size, self.n_state), dtype=float)
+        self._nparents = np.zeros(max_size, dtype=int)
+        self._nchilds = []
+        self._npaths = []
+        self._ncosts = np.zeros(max_size, dtype=float)
+        self._nvalues = np.zeros(max_size, dtype=float)
+        #
         start = np.array(start, dtype=float).squeeze()
         goal = np.array(goal, dtype=float).squeeze()
-        self.start = self.Node(
-            pos=start,
-            parent=-1,
-            childs=[],
-            path=None,
-            stage_cost=0.0,
-            cost=0.0,
-            radius=float("inf"),
-        )
-        self.goal = self.Node(
-            pos=goal,
-            parent=-1,
-            path=None,
-            childs=[],
-            stage_cost=0.0,
-            cost=0.0,
-            radius=float("inf"),
-        )
-        self.n_state = 3
+        self.start = start
+        self.goal = goal
+        self._add_node(pos=start, parent=-1, path=None, cost=-1, value=-1)
+        self.paths = []
+        self._best_value = float("inf")
+        self._best_ind = None
+        self._goal_inds_mask = np.zeros(max_size, dtype=bool)
+        #
         (lbx, ubx), (lby, uby) = bounds
         self.lb = np.array([lbx, lby, -np.pi])
         self.ub = np.array([ubx, uby, np.pi])
@@ -310,19 +312,11 @@ class RRTDubins:
             self.max_stride = (
                 0.2 * self._weighted_norm((self.ub - self.lb)) ** 0.5
             )
-        self.min_res = min_res
+        self.min_res = min_res  # minimum resolution of Dubin planner.
         self.step = int(self.max_stride / self.min_res)
-        self.min_radius = min_radius
+        self.min_radius = min_radius  # Minimum radius of turning.
         self.goal_bias = goal_bias
-        self.thr = threshold
-        #
-        self.nodes = [self.start]
-        self.paths = []
-        self.N = 1
-        self._poses = np.zeros((max_size * 10, self.n_state))
-        self._poses[0] = self.start["pos"].copy()
-        self._best_cost = float("inf")
-        self._goal_inds_mask = np.zeros(max_size, dtype=bool)
+        self.thr = threshold  # threshold for checking proximity.
 
     def plan(self, fig_name=None, anim_name=False, anim_online=False):
         artists = []
@@ -333,45 +327,56 @@ class RRTDubins:
             # Draw a collision free sample from state space.
             rnd = self._sample_collision_free()
             # Find nearest node
-            nearest_ind, nearest_node = self._nearest_node(rnd)
+            nearest_ind, nearest_pos = self._nearest_node(rnd)
             # Calculate path from nearest to rnd.
-            path = self._steer(nearest_node["pos"], rnd)
+            path = self._steer(nearest_pos, rnd)
             # Check the path for collision.
             is_collision, ind_collision = self._is_collision(path)
             # Add new nodes.
-            new_node, reached_goal = self._extend(
-                nearest_ind, nearest_node, path, ind_collision
+            new_pos, new_path, reached_goal = self._extend(
+                nearest_ind, path, ind_collision
             )
-            print(f"iteration = {i:>6d}")
+            if not i % 10:
+                print(f"iteration = {i:>6d}")
             # Draw path and check for stoppage.
             arts = []
-            if new_node is not None:
-                arts += self._draw(ax, new_node, color="deepskyblue", zorder=1)
+            if new_pos is not None:
+                arts += self._draw(ax, new_path, color="deepskyblue", zorder=1)
             if arts and anim_name:
                 artists.append(arts)
-            #
-            if anim_online:
-                plt.pause(0.001)
             #
             if reached_goal:
                 # Update goal index mask.
                 self._goal_inds_mask[self.N - 1] = True
-                print(self.N - 1)
-                # If path is shorter, add it to path list.
-                if new_node["cost"] < self._best_cost:
-                    self._best_cost = new_node["cost"]
-                    print(f"best cost: {self._best_cost}")
-                    print("Solution found.")
-                    path = self._generate_path()
+                reached_goal = False
+            #
+            goal_inds = np.where(self._goal_inds_mask)[0]
+            goal_values = self._nvalues[goal_inds]
+            if len(goal_values) > 0:
+                candidate_best_value = goal_values.min()
+                if candidate_best_value < self._best_value:
                     arts = []
-                    for node in path["nodes"]:
-                        arts += self._draw(ax, node, color="magenta", zorder=3)
+                    # Redraw previous best path in other color.
+                    if self._best_ind is not None:
+                        for path in self.paths[self._best_ind]["paths"]:
+                            arts += self._draw(
+                                ax, path, color="violet", zorder=3
+                            )
+                    #
+                    self._generate_path(goal_inds[goal_values.argmin()])
+                    self._best_ind = len(self.paths) - 1
+                    self._best_value = candidate_best_value
+                    print(f"best cost: {self._best_value}")
+                    print("Solution found.")
+                    # Draw new best path.
+                    for path in self.paths[self._best_ind]["paths"]:
+                        arts += self._draw(ax, path, color="magenta", zorder=3)
                     if arts:
                         artists.append(arts)
-                    plt.pause(0.001)
-                    if self._get_stop_req():
-                        break
-                reached_goal = False
+                    """ if self._get_stop_req():
+                        break """
+            if anim_online:
+                plt.pause(0.001)
         # Saving final figure.
         if fig_name is not None:
             self._save_plot(fig, fig_name)
@@ -383,33 +388,41 @@ class RRTDubins:
             )
         return fig, ax, anim
 
+    def _add_node(self, *, pos, parent, path, cost, value):
+        self._nposes[self.N] = pos
+        self._nparents[self.N] = parent
+        self._nchilds.append([])
+        self._npaths.append(path)
+        self._ncosts[self.N] = cost
+        self._nvalues[self.N] = value
+        self.N += 1
+
     def _sample(self):
-        prob = np.random.rand()
+        prob = np.random.random()
         if prob > self.goal_bias:
             return np.random.uniform(self.lb, self.ub)
         else:
-            return self.goal["pos"]
+            return self.goal
 
     def _sample_collision_free(self):
-        while True:
+        is_collision = True
+        while is_collision:
             rnd = self._sample()
             rndc = rnd.copy()
             rndc[-1] = 0.0
             is_collision, _ = self.collision.is_collision(rndc[None, :])
-            if not is_collision:
-                break
         return rnd
 
     def _nearest_node(self, pos):
-        dposes = self._poses[: self.N] - pos
+        dposes = self._nposes[: self.N] - pos
         distances = self._weighted_norm(dposes)
         distances[self._goal_inds_mask[: self.N]] = np.inf
         nearest_ind = np.argmin(distances)
         # nearest_ind = np.where(
         #    distances == np.min(distances[self._goal_mask_inds[: self.N]])
         # )[0][0]
-        nearest_node = self.nodes[nearest_ind]
-        return nearest_ind, nearest_node
+        nearest_pos = self._nposes[nearest_ind]
+        return nearest_ind, nearest_pos
 
     def _weighted_norm(self, vects):
         return (
@@ -436,47 +449,52 @@ class RRTDubins:
         ind_collision += (not is_collision) * (len(path) + 1)
         return is_collision, ind_collision
 
-    def _extend(self, nearest_ind, nearest_node, path, ind_collision):
-        new_node = None
+    def _extend(self, nearest_ind, path, ind_collision):
+        new_pos = None
+        new_path = None
         reached_goal = False
         lpath = len(path)
         if lpath > 1:
             step = min(lpath - 1, self.step)
             if ind_collision > (lpath - 1):
                 # Whole collision free, check if goal reached.
-                if self._weighted_norm(path[-1] - self.goal["pos"]) < self.thr:
+                if self._weighted_norm(path[-1] - self.goal) < self.thr:
                     reached_goal = True
                     step = lpath - 1
             # If collision free, build the node.
             if ind_collision > max(1, step):
-                stage_cost = step * self.min_res
-                cost = nearest_node["cost"] + stage_cost
-                new_node = self.Node(
-                    pos=path[step],
+                cost = step * self.min_res
+                value = self._nvalues[nearest_ind] + cost
+                # Update nearest node child list.
+                self._nchilds[nearest_ind].append(self.N)
+                # Add new node
+                new_pos = path[step]
+                new_path = path[: step + 1]
+                self._add_node(
+                    pos=new_pos,
                     parent=nearest_ind,
-                    childs=[],
-                    path=path[: step + 1],
-                    stage_cost=stage_cost,
+                    path=new_path,
                     cost=cost,
+                    value=value,
                 )
-                nearest_node["childs"].append(self.N)
-                self._poses[self.N] = path[step]
-                self.nodes.append(new_node)
-                self.N += 1
-        return new_node, reached_goal
+        return new_pos, new_path, reached_goal
 
     def _generate_path(self, ind):
         # Generate final path and draw it.
-        path_nodes = [self.nodes[ind]]
-        cost = path_nodes[0]["cost"]
+        tree_paths = self._npaths[: self.N]
+        tree_parents = self._nparents[: self.N]
+        #
+        inds = [ind]
+        paths = [tree_paths[ind].copy()]
+        value = self._nvalues[ind]
         print(f"Number of tree nodes {self.N}")
-        while True:
-            parent = path_nodes[0]["parent"]
-            if parent < 1:
-                break
-            path_nodes.insert(0, self.nodes[parent])
-            cost += path_nodes[0]["cost"]
-        path = self.Path(nodes=path_nodes, cost=cost)
+        parent = tree_parents[ind]
+        while parent > 0:
+            ind = parent
+            inds.insert(0, ind)
+            paths.insert(0, tree_paths[ind].copy())
+            parent = tree_parents[ind]
+        path = self.Path(inds=inds, paths=paths, value=value)
         self.paths.append(path)
         return path
 
@@ -502,8 +520,8 @@ class RRTDubins:
             ax.add_patch(Polygon(cnt, color="k", zorder=2.0))
         # Draw start and end.
         ax.plot(
-            self.start["pos"][0],
-            self.start["pos"][1],
+            self.start[0],
+            self.start[1],
             ls="",
             marker="s",
             mfc="yellow",
@@ -512,8 +530,8 @@ class RRTDubins:
             label="start",
         )
         ax.plot(
-            self.goal["pos"][0],
-            self.goal["pos"][1],
+            self.goal[0],
+            self.goal[1],
             ls="",
             marker="s",
             mfc="lime",
@@ -532,10 +550,8 @@ class RRTDubins:
         ax.set_aspect("equal", adjustable="box")
         return fig, ax, cid
 
-    def _draw(self, ax, node, color="deepskyblue", zorder=1):
+    def _draw(self, ax, path, color="deepskyblue", zorder=1):
         arts = []
-        pos = node["pos"]
-        path = node["path"]
         n = min(2, len(path))
         arts += ax.plot(
             path[:, 0], path[:, 1], ls="-", lw=1.0, c=color, zorder=zorder
@@ -599,6 +615,7 @@ class RRTSDubins(RRTDubins):
         min_res=1,
         min_radius=10,
         goal_bias=0.05,
+        threshold=1e-3,
     ) -> None:
         super().__init__(
             start,
@@ -613,12 +630,12 @@ class RRTSDubins(RRTDubins):
             min_res,
             min_radius,
             goal_bias,
+            threshold,
         )
         self._gamma_s = self._calc_gamma_star()
         self._k_s = 2 * np.exp(1)
 
     def plans(self, fig_name=None, anim_name=False, anim_online=False):
-        stop_plan = False
         artists = []
         fig, ax = plt.subplots(constrained_layout=True)
         fig, ax, cid = self._set_up_plot(fig, ax)
@@ -627,60 +644,63 @@ class RRTSDubins(RRTDubins):
             # Draw a collision free sample from state space.
             rnd = self._sample_collision_free()
             # Find nearest node
-            nearest_ind, nearest_node = self._nearest_node(rnd)
+            nearest_ind, nearest_pos = self._nearest_node(rnd)
             # Calculate path from nearest to rnd.
-            path = self._steer(nearest_node["pos"], rnd)
+            path = self._steer(nearest_pos, rnd)
             # Check the path for collision.
             is_collision, ind_collision = self._is_collision(path)
             # Add new nodes.
-            new_node, reached_goal = self._extend(
-                nearest_ind, nearest_node, path, ind_collision
+            new_pos, new_path, reached_goal = self._extend(
+                nearest_ind, path, ind_collision
             )
-            print(f"iteration = {i:>6d}")
+            if not i % 10:
+                print(f"iteration = {i:>6d}")
             arts = []
-            if new_node is not None:
+            if new_pos is not None:
                 # Find nearest neighbors.
-                near_inds, near_nodes = self._nearest_neighbor(
-                    new_node["pos"]
-                )
+                near_inds, near_poses = self._nearest_neighbor(new_pos)
                 # Rewire new_node.
-                self._rewire_new_node(near_inds, near_nodes, new_node)
+                self._rewire_new_node(near_inds, near_poses, new_pos)
                 # Rewire nearest neighbors.
-                rewired = self._rewire_near_nodes(
-                    near_inds, near_nodes, new_node
-                )
+                self._rewire_near_nodes(near_inds, near_poses, new_pos)
                 # Draw path and check for stoppage.
-                arts += self._draw(ax, new_node, color="deepskyblue", zorder=1)
+                arts += self._draw(
+                    ax, self._npaths[self.N - 1], color="deepskyblue", zorder=1
+                )
             if arts and anim_name:
                 artists.append(arts)
-            #
-            if anim_online:
-                plt.pause(0.001)
             #
             if reached_goal:
                 # Update goal index mask.
                 self._goal_inds_mask[self.N - 1] = True
                 reached_goal = False
             #
-            for goal_ind in np.where(self._goal_inds_mask)[0]:
-                node = self.nodes[goal_ind]
-                # If path is shorter, add it to path list.
-                if node["cost"] < self._best_cost:
-                    self._best_cost = node["cost"]
-                    print(f"best cost: {self._best_cost}")
-                    print("Solution found.")
-                    path = self._generate_path(goal_ind)
+            goal_inds = np.where(self._goal_inds_mask)[0]
+            goal_values = self._nvalues[goal_inds]
+            if len(goal_values) > 0:
+                candidate_best_value = goal_values.min()
+                if candidate_best_value < self._best_value:
                     arts = []
-                    for node in path["nodes"]:
-                        arts += self._draw(ax, node, color="magenta", zorder=3)
+                    # Redraw previous best path in other color.
+                    if self._best_ind is not None:
+                        for path in self.paths[self._best_ind]["paths"]:
+                            arts += self._draw(
+                                ax, path, color="violet", zorder=3
+                            )
+                    #
+                    self._generate_path(goal_inds[goal_values.argmin()])
+                    self._best_ind = len(self.paths) - 1
+                    self._best_value = candidate_best_value
+                    print(f"Best value: {self._best_value}")
+                    print("Solution found.")
+                    # Draw new best path.
+                    for path in self.paths[self._best_ind]["paths"]:
+                        arts += self._draw(ax, path, color="magenta", zorder=3)
                     if arts:
                         artists.append(arts)
-                    plt.pause(0.001)
-                    """ if self._get_stop_req():
-                        stop_plan = True
-                        break """
-            if stop_plan:
-                break
+        #
+        if anim_online:
+            plt.pause(0.001)
         # Saving final figure.
         if fig_name is not None:
             self._save_plot(fig, fig_name)
@@ -701,16 +721,19 @@ class RRTSDubins(RRTDubins):
         return gamma_star
 
     def _nearest_neighbor(self, pos):
-        distances = self._weighted_norm(self._poses[: self.N - 1] - pos)
+        #r = self._gamma_s * (np.log(self.N)/self.N)**(1/self.n_state)
+        #r = self.max_stride
+        r = self._gamma_s
+        distances = self._weighted_norm(self._nposes[: self.N - 1] - pos)
         distances[self._goal_inds_mask[: self.N - 1]] = np.inf
-        near_inds = np.where(distances <= self._gamma_s)[0]
+        near_inds = np.where(distances <= r)[0]
         near_inds = near_inds[np.argsort(distances[near_inds])]
-        near_nodes = [self.nodes[near_ind] for near_ind in near_inds]
-        return near_inds, near_nodes
+        near_poses = self._nposes[near_inds]
+        return near_inds, near_poses
 
     def _k_nearest_neighbor(self, pos):
         # Do not consider last node in calculating distances.
-        distances = self._weighted_norm(self._poses[: self.N - 1] - pos)
+        distances = self._weighted_norm(self._nposes[: self.N - 1] - pos)
         distances[self._goal_inds_mask[: self.N - 1]] = np.inf
         k = int(self._k_s * np.log(self.N))
         #
@@ -719,46 +742,123 @@ class RRTSDubins(RRTDubins):
         else:
             near_inds = np.argpartition(distances, k)[:k]
             near_inds = near_inds[np.argsort(distances[near_inds])]
-        near_nodes = [self.nodes[near_ind] for near_ind in near_inds]
-        return near_inds, near_nodes
+        near_poses = self._nposes[near_inds]
+        return near_inds, near_poses
 
-    def _rewire(self, parent_ind, parent_node, child_ind, child_node):
-        path = self._steer(parent_node["pos"], child_node["pos"])
+    def _rewire_new_node(self, near_inds, near_poses, new_pos):
+        new_ind = self.N - 1
+        new_value = self._nvalues[new_ind]
+        # Filter out near nodes with value greater than new node.
+        estimated_values = self._nvalues[near_inds] + np.linalg.norm(
+            (self._nposes[near_inds] - new_pos)[:, :2], axis=1
+        )
+        inds = np.where(estimated_values < new_value)
+        near_inds = near_inds[inds][1:]
+        near_poses = near_poses[inds][1:]
+        # Calculate paths and costs.
+        paths = []
+        costs = []
+        for near_ind, near_pos in zip(near_inds, near_poses):
+            path = self._steer(near_pos, new_pos)
+            cost = self.min_res * (len(path) - 1)
+            paths.append(path)
+            costs.append(cost)
+        values = self._nvalues[near_inds] + np.array(costs)
+        # Test for collision and rewire if needed.
+        sorted_value_inds = np.argsort(values)
+        for i in sorted_value_inds:
+            value = values[i]
+            if value < new_value:
+                # Check for collision.
+                path = paths[i]
+                is_collision, _ = self._is_collision(path)
+                if not is_collision:
+                    # Remove new node from its parent's child list.
+                    prev_parent_ind = self._nparents[new_ind]
+                    self._nchilds[prev_parent_ind].remove(new_ind)
+                    # Update child node and its new parent paremeters.
+                    self._nparents[new_ind] = near_inds[i]
+                    self._npaths[new_ind] = path
+                    self._ncosts[new_ind] = costs[i]
+                    self._nvalues[new_ind] = value
+                    self._nchilds[near_inds[i]].append(new_ind)
+                    break
+            else:
+                break
+
+    def _rewire_near_nodes(self, near_inds, near_poses, new_pos):
+        new_ind = self.N - 1
+        new_value = self._nvalues[new_ind]
+        # Filter out near nodes with value smaller than new node.
+        estimated_values = self._nvalues[near_inds] + np.linalg.norm(
+            (self._nposes[near_inds] - new_pos)[:, :2], axis=1
+        )
+        inds = np.where(estimated_values > new_value)
+        near_inds = near_inds[inds]
+        near_poses = near_poses[inds]
+        # Calculate paths and costs.
+        paths = []
+        costs = []
+        for near_ind, near_pos in zip(near_inds, near_poses):
+            path = self._steer(new_pos, near_pos)
+            cost = self.min_res * (len(path) - 1)
+            paths.append(path)
+            costs.append(cost)
+        values = new_value + np.array(costs)
+        # Test for collision and rewire if needed.
+        for near_ind, path, cost, value in zip(
+            near_inds, paths, costs, values
+        ):
+            prev_value = self._nvalues[near_ind]
+            if value < prev_value:
+                # Rewire if it is collision free.
+                is_collision, _ = self._is_collision(path)
+                if not is_collision:
+                    # Remove near node from its parent's child list.
+                    prev_parent_ind = self._nparents[near_ind]
+                    self._nchilds[prev_parent_ind].remove(near_ind)
+                    # Update child node and its new parent paremeters.
+                    self._nparents[near_ind] = new_ind
+                    self._npaths[near_ind] = path
+                    self._ncosts[near_ind] = cost
+                    self._nvalues[near_ind] = value
+                    self._nchilds[new_ind].append(near_ind)
+                    # Propagate changes.
+                    value_diff = value - prev_value
+                    self._propagate_cost_to_childs(near_ind, value_diff)
+
+    def _rewire(self, parent_ind, parent_pos, child_ind, child_pos):
+        path = self._steer(parent_pos, child_pos)
         stage_cost = self.min_res * (len(path) - 1)
-        cost = parent_node["cost"] + stage_cost
-        if cost < child_node["cost"]:
+        cost = self._nodes["cost"][parent_ind] + stage_cost
+        if cost < self._nodes["cost"][child_ind]:
             is_collision, _ = self._is_collision(path)
             if not is_collision:
                 # Remove child node from its parent's child list.
-                prev_parent = self.nodes[child_node["parent"]]
-                prev_parent["childs"].remove(child_ind)
+                prev_parent_ind = self._nodes["parent"][child_ind]
+                self._modes["childs"][prev_parent_ind].remove(child_ind)
                 # Update child node and its new parent paremeters.
-                child_node["parent"] = parent_ind
-                child_node["path"] = path
-                child_node["stage_cost"] = stage_cost
-                child_node["cost"] = cost
-                parent_node["childs"].append(child_ind)
-                self._propagate_cost_to_childs(child_node)
+                self._nodes["parent"][child_ind] = parent_ind
+                self._nodes["path"][child_ind] = path
+                self._nodes["stage_cost"][child_ind] = stage_cost
+                self._nodes["cost"][child_ind] = cost
+                self._nodes["childs"][parent_ind].append(child_ind)
+                self._propagate_cost_to_childs(child_ind)
                 return True
         return False
 
-    def _rewire_new_node(self, near_inds, near_nodes, new_node):
-        for near_ind, near_node in zip(near_inds[1:], near_nodes[1:]):
-            self._rewire(near_ind, near_node, self.N - 1, new_node)
+    def _get_all_childs(self, ind):
+        child_inds = self._nchilds[ind]
+        childs = child_inds
+        for ind in child_inds:
+            childs += self._get_all_childs(ind)
+        return childs
 
-    def _rewire_near_nodes(self, near_inds, near_nodes, new_node):
-        rewired = []
-        for near_ind, near_node in zip(near_inds, near_nodes):
-            rewired.append(
-                self._rewire(self.N - 1, new_node, near_ind, near_node)
-            )
-        return rewired
-
-    def _propagate_cost_to_childs(self, node):
-        for child_ind in node["childs"]:
-            child_node = self.nodes[child_ind]
-            child_node["cost"] = node["cost"] + child_node["stage_cost"]
-            self._propagate_cost_to_childs(child_node)
+    def _propagate_cost_to_childs(self, ind, value_diff):
+        # Get list of indexes of all childs down the tree.
+        childs = self._get_all_childs(ind)
+        # Add value diff to all childs.
+        self._nvalues[childs] += value_diff
 
 
 def test_collision():
@@ -853,7 +953,7 @@ def test_rrts():
         stypes,
         obs_contours,
         norm_weights=[1, 1, 1],
-        max_size=2000,
+        max_size=1000,
         max_stride=150,
         min_res=1.0,
         min_radius=14.02,
@@ -863,9 +963,12 @@ def test_rrts():
     fig_name = None  # "final_plan"#
     anim_name = None  # "final_plan"#
 
-    fig, ax, anim = rrt.plans(
+    tstart = time.time()
+    fig, ax, anim = rrt.plan(
         fig_name=fig_name, anim_name=anim_name, anim_online=anim_online
     )
+    tfinish = time.time()
+    print(f"Elapsed time is: {tfinish - tstart:+07.2f}s")
     plt.show()
 
 
